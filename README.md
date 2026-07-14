@@ -1,19 +1,20 @@
 # LongCareBot backend
 
-An async Python backend for a long-care virtual companion. It accepts text produced by the frontend's wake-word/ASR pipeline, searches PostgreSQL for previously answered questions, asks an OpenRouter-hosted model for an answer, and streams the response over Server-Sent Events (SSE).
+An async Python backend for a long-care virtual companion. It accepts text produced by the frontend's wake-word/ASR pipeline, searches PostgreSQL for previously answered questions, asks a local Ollama-hosted model (via the OpenAI Agents SDK) for an answer, and streams the response over Server-Sent Events (SSE).
+
+See [API.md](API.md) for the complete route, parameter, request-body, response, SSE, and WebSocket reference.
 
 ## Docker Compose quick start
-
-Requirements: Python 3.11+, PostgreSQL, and [uv](https://docs.astral.sh/uv/).
+Requirements: Docker + Docker Compose. (For running the services outside Docker: Python 3.11+, PostgreSQL, and [uv](https://docs.astral.sh/uv/).)
 
 ```bash
 cp .env.example .env
 docker compose up --build -d 
 ```
 
-The public gateway is available at `http://localhost:8000`. Compose runs three services:
+The public gateway is available at `http://localhost:8000`. Compose runs four services:
 
-- `postgres`: PostgreSQL plus the initial schema.
+- `postgres`: PostgreSQL plus the initial schema. All accounts live in `members`; patient profiles reference member IDs through `patients`.
 - `agent`: private OpenAI Agents SDK service on the Compose network, backed by local Ollama.
 - `gateway`: public FastAPI API, SSE proxy, and family WebSocket hub.
 - `ollama`: local model runtime. The agent automatically pulls `gemma4:e2b` into the persistent `ollama_data` volume on first startup.
@@ -44,7 +45,23 @@ The endpoint emits SSE events: `text_delta`, then `completed` (or `error`). A fr
 
 ## Family notifications
 
-Create a patient and associated family member in `patients` and `family_members`. A family frontend connects to:
+Create members first. Setting `is_patient: true` also creates the corresponding row in `patients`:
+
+```bash
+curl -X POST http://localhost:8000/v1/members \
+  -H 'content-type: application/json' \
+  -d '{"id":"patient-1","display_name":"Alice","is_patient":true}'
+
+curl -X POST http://localhost:8000/v1/members \
+  -H 'content-type: application/json' \
+  -d '{"id":"family-1","display_name":"Bob","is_patient":false}'
+
+curl -X POST http://localhost:8000/v1/patients/patient-1/family-members \
+  -H 'content-type: application/json' \
+  -d '{"member_id":"family-1"}'
+```
+
+A family frontend connects to:
 
 ```text
 ws://localhost:8000/v1/family/ws/{family_member_id}/{patient_id}

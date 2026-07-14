@@ -58,7 +58,9 @@ class AskRequest(BaseModel):
 
 
 async def events(request: Request, body: AskRequest):
-    assert companion is not None
+    if companion is None:
+        yield f"event: error\ndata: {json.dumps({'message': 'Agent not ready'})}\n\n"
+        return
     try:
         async for delta in companion.answer(body.patient_id, body.question):
             if await request.is_disconnected():

@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 import asyncpg
 import httpx
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -27,7 +27,13 @@ class FamilyHub:
 
     async def disconnect(self, member_id: str, socket: WebSocket):
         async with self.lock:
-            self.clients.get(member_id, set()).discard(socket)
+            group = self.clients.get(member_id)
+            if not group:
+                return
+            group.discard(socket)
+            if not group:
+                self.clients.pop(member_id, None)
+                _member_patients.pop(member_id, None)
 
     async def broadcast(self, payload: dict):
         patient_id = payload["patient_id"]
@@ -79,6 +85,17 @@ class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
 
 
+class MemberRequest(BaseModel):
+    id: str = Field(min_length=1, max_length=200)
+    display_name: str = Field(min_length=1, max_length=200)
+    email: str | None = None
+    is_patient: bool = False
+
+
+class FamilyLinkRequest(BaseModel):
+    member_id: str = Field(min_length=1, max_length=200)
+
+
 class FamilyAnswer(BaseModel):
     patient_id: str = Field(min_length=1)
     answer: str = Field(min_length=1, max_length=4000)
@@ -100,12 +117,33 @@ async def proxy_events(request: Request, body: AskRequest):
 
 @app.post("/v1/companion/ask")
 async def ask(request: Request, body: AskRequest):
+    if not await db.patient_exists(body.patient_id):
+        raise HTTPException(status_code=404, detail=f"Patient '{body.patient_id}' does not exist")
     return StreamingResponse(proxy_events(request, body), media_type="text/event-stream")
+
+
+@app.post("/v1/members", status_code=201)
+async def create_member(body: MemberRequest):
+    try:
+        await db.create_member(body.id, body.display_name, body.email, body.is_patient)
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(status_code=409, detail="Member already exists") from None
+    return {"id": body.id, "is_patient": body.is_patient}
+
+
+@app.post("/v1/patients/{patient_id}/family-members", status_code=201)
+async def link_family_member(patient_id: str, body: FamilyLinkRequest):
+    if not await db.patient_exists(patient_id):
+        raise HTTPException(status_code=404, detail="Patient does not exist")
+    await db.add_family_member(patient_id, body.member_id)
+    if not await db.member_can_access_patient(body.member_id, patient_id):
+        raise HTTPException(status_code=400, detail="Member does not exist or is a patient")
+    return {"ok": True}
 
 
 @app.websocket("/v1/family/ws/{member_id}/{patient_id}")
 async def family_socket(socket: WebSocket, member_id: str, patient_id: str):
-    if not await db.family_member_can_access(member_id, patient_id):
+    if not await db.member_can_access_patient(member_id, patient_id):
         await socket.close(code=1008)
         return
     _member_patients[member_id] = patient_id
@@ -119,6 +157,8 @@ async def family_socket(socket: WebSocket, member_id: str, patient_id: str):
 
 @app.post("/v1/family/notifications/{notification_id}/answer")
 async def answer_family(notification_id: int, body: FamilyAnswer):
+    if not await db.patient_exists(body.patient_id):
+        raise HTTPException(status_code=404, detail=f"Patient '{body.patient_id}' does not exist")
     if not await db.answer_family_notification(notification_id, body.patient_id, body.answer):
         return {"ok": False, "message": "Pending notification not found"}
     return {"ok": True}
